@@ -53,20 +53,59 @@ def yolo_obb_line(class_id: int, xy4, w: int, h: int) -> str:
     return f"{class_id} {coords_str}"
 
 
+def class_preview_label(class_id: int, confidence: float, names) -> str:
+    """Build a preview label containing class name, ID, and confidence."""
+    class_name = None
+
+    if isinstance(names, dict):
+        class_name = names.get(class_id, names.get(str(class_id)))
+    elif isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+        class_name = names[class_id]
+
+    if class_name is None:
+        class_name = f"class_{class_id}"
+
+    return f"{class_name}-{class_id}  {confidence * 100:.1f}%"
+
+
+def _draw_label(img, label: str, x: int, y: int, color: tuple):
+    """
+    Helper: draws a filled colour pill behind `label` for maximum readability.
+    Text is rendered in black over the filled background.
+    `x`, `y` are the top-left anchor of the bounding box / OBB.
+    """
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness  = 1
+
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    # Keep the tag from going above the image top
+    tag_top = max(0, y - th - baseline - 2)
+    tag_bot = tag_top + th + baseline + 4
+
+    # Filled background rectangle
+    cv2.rectangle(img, (x, tag_top), (x + tw + 6, tag_bot), color, -1)
+
+    # Black text on top for contrast
+    cv2.putText(
+        img, label,
+        (x + 3, tag_bot - baseline - 1),
+        font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA,
+    )
+
+
 def draw_box(img, x1, y1, x2, y2, label: str):
-    """Draw standard rectangle bbox"""
+    """Draw standard rectangle bbox with a filled confidence label tag."""
     x1i, y1i, x2i, y2i = map(lambda v: int(round(v)), [x1, y1, x2, y2])
     color = (255, 191, 0)  # Deep Sky Blue (BGR)
     cv2.rectangle(img, (x1i, y1i), (x2i, y2i), color, 2)
     if label:
-        cv2.putText(
-            img, label, (x1i, max(0, y1i - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
-        )
+        _draw_label(img, label, x1i, y1i, color)
 
 
 def draw_obb(img, xy4, label: str):
-    """Draw oriented bounding box (OBB) polygon"""
+    """Draw oriented bounding box (OBB) polygon with a filled confidence label tag."""
     pts = xy4.astype(np.int32)
     pts = pts.reshape((-1, 1, 2))
     color = (0, 255, 127)  # Spring Green (BGR)
@@ -74,11 +113,8 @@ def draw_obb(img, xy4, label: str):
     cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2)
 
     if label:
-        x1, y1 = pts[0][0]
-        cv2.putText(
-            img, label, (int(x1), max(0, int(y1) - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
-        )
+        x1, y1 = int(pts[0][0][0]), int(pts[0][0][1])
+        _draw_label(img, label, x1, y1, color)
 
 
 class App(tk.Tk):
@@ -97,8 +133,7 @@ class App(tk.Tk):
         self.iou = tk.StringVar(value="0.70")
         self.save_images = tk.BooleanVar(value=True)
 
-        # NEW: Task mode for ONNX (OBB optional)
-        # Auto: try to load and run; Detect: force bbox; OBB: force obb
+        # Task mode for ONNX (OBB optional)
         self.task_mode = tk.StringVar(value="Auto")
 
         self._worker_thread = None
@@ -185,7 +220,6 @@ class App(tk.Tk):
             side="left"
         )
 
-        # NEW: Task mode selector for ONNX
         r2 = tk.Frame(card, bg=COLOR_CARD)
         r2.pack(fill="x", pady=(10, 0))
 
@@ -434,23 +468,18 @@ class App(tk.Tk):
         self._log_line(">>> STOP COMMAND RECEIVED")
 
     def _load_model(self, mp: str):
-        """
-        Loads PT or ONNX model.
-        For ONNX, uses task_mode if selected.
-        """
+        """Loads PT or ONNX model. For ONNX, uses task_mode if selected."""
         ext = Path(mp).suffix.lower()
 
         if ext == ".pt":
             return YOLO(mp)
 
-        # ONNX
         mode = self.task_mode.get()
         if mode == "Detect (BBox)":
             return YOLO(mp, task="detect")
         if mode == "OBB":
             return YOLO(mp, task="obb")
 
-        # Auto mode: try without task first; fallback to detect
         try:
             return YOLO(mp)
         except Exception:
@@ -508,10 +537,11 @@ class App(tk.Tk):
 
                 results = model.predict(**predict_kwargs)
                 r = results[0]
+                class_names = getattr(r, "names", getattr(model, "names", {}))
 
                 lines = []
 
-                # --- OBB DETECTION (OPTIONAL) ---
+                # --- OBB DETECTION ---
                 if getattr(r, "obb", None) is not None and r.obb is not None:
                     xy4_tensor = r.obb.xyxyxyxy.cpu().numpy()
                     cls_tensor = r.obb.cls.cpu().numpy().astype(int)
@@ -522,7 +552,8 @@ class App(tk.Tk):
                             continue
                         lines.append(yolo_obb_line(c, xy4, w, h))
                         if preview_dir is not None:
-                            draw_obb(img, xy4, f"{c} {cf:.2f}")
+                            label = class_preview_label(c, cf, class_names)
+                            draw_obb(img, xy4, label)
 
                 # --- STANDARD BBOX DETECTION ---
                 elif getattr(r, "boxes", None) is not None and r.boxes is not None:
@@ -535,7 +566,8 @@ class App(tk.Tk):
                             continue
                         lines.append(yolo_txt_line(c, x1, y1, x2, y2, w, h))
                         if preview_dir is not None:
-                            draw_box(img, x1, y1, x2, y2, f"{c} {cf:.2f}")
+                            label = class_preview_label(c, cf, class_names)
+                            draw_box(img, x1, y1, x2, y2, label)
 
                 # --- SAVE LABELS ---
                 label_path = out_dir / f"{img_path.stem}.txt"
